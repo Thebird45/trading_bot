@@ -1,0 +1,29 @@
+# ============================================
+# TRADING BOT PRO - Dependencias
+# Compatible con Python 3.13 + Windows
+# ============================================
+
+# Datos y análisis
+pandas>=2.2.3
+numpy>=2.2.0
+
+# Indicadores técnicos
+ta>=0.11.0
+
+# Conexión a exchanges
+ccxt>=4.4.0
+
+# Machine Learning (Fases 8-9)
+scikit-learn>=1.6.0
+xgboost>=2.1.1
+
+# Visualización y dashboard
+matplotlib>=3.10.0
+plotly>=5.24.0
+streamlit>=1.40.0
+
+# Utilidades
+python-dotenv>=1.0.1
+requests>=2.32.3
+schedule>=1.2.2
+loguru>=0.7.2
