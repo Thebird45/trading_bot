@@ -18,8 +18,31 @@ import ta
 import json
 import os
 import time
+import threading
 from datetime import datetime, timezone
 from loguru import logger
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# ============================================
+# MINI SERVIDOR WEB (para que Render no duerma)
+# ============================================
+
+class PingHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Trading Bot PRO - Fase 6 corriendo!")
+
+    def log_message(self, format, *args):
+        pass  # silenciar logs del servidor
+
+
+def iniciar_servidor_web():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), PingHandler)
+    server.serve_forever()
+
 
 # ============================================
 # CONFIGURACIÓN
@@ -230,6 +253,10 @@ def mostrar_estado(estado, precio_actual, rsi, senal, params, ciclo):
 # ============================================
 
 def main():
+    # Iniciar servidor web en hilo separado (necesario para Render)
+    threading.Thread(target=iniciar_servidor_web, daemon=True).start()
+    logger.info("Servidor web iniciado para mantener el servicio activo")
+
     params  = cargar_params()
     estado  = EstadoBot(CAPITAL_INICIAL)
     exchange= crear_exchange()
