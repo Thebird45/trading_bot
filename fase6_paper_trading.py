@@ -142,6 +142,7 @@ def crear_exchange():
     return ccxt.bybit({
         "options"        : {"defaultType": "spot"},
         "enableRateLimit": True,
+        "hostname"       : "api.bytick.com",  # dominio alternativo sin geo-block
     })
 
 
