@@ -139,10 +139,9 @@ class EstadoBot:
 # ============================================
 
 def crear_exchange():
-    return ccxt.bybit({
+    return ccxt.binance({
         "options"        : {"defaultType": "spot"},
         "enableRateLimit": True,
-        "hostname"       : "api.bytick.com",  # dominio alternativo sin geo-block
     })
 
 
