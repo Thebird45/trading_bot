@@ -291,6 +291,23 @@ def mostrar_estado(estado, precio_actual, rsi, senal, params, ciclo):
 # BUCLE PRINCIPAL (VERSIÓN MEJORADA)
 # ============================================
 def main():
+    print("🔥 DEBUG: Script iniciado - Versión FINAL con Binance")
+    
+    try:
+        # Iniciar servidor web para Render
+        threading.Thread(target=iniciar_servidor_web, daemon=True).start()
+        logger.info("Servidor web iniciado (anti-sleep en Render)")
+
+        params = cargar_params()
+        estado = EstadoBot(CAPITAL_INICIAL)
+        exchange = crear_exchange()
+
+        print("✅ DEBUG: Exchange creado correctamente (Binance)")
+
+    except Exception as e:
+        print(f"❌ ERROR CRÍTICO AL INICIAR: {e}")
+        logger.exception("Error fatal al iniciar el bot")
+        raise   # para que Render muestre el traceback completo
     # Iniciar servidor web para mantener Render activo
     threading.Thread(target=iniciar_servidor_web, daemon=True).start()
     logger.info("Servidor web iniciado (anti-sleep en Render)")
