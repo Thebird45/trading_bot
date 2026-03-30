@@ -138,19 +138,30 @@ class EstadoBot:
 # FUNCIONES DE MERCADO
 # ============================================
 
+# ============================================
+# FUNCIONES DE MERCADO
+# ============================================
 def crear_exchange():
     return ccxt.binance({
-        "options"        : {"defaultType": "spot"},
-        "enableRateLimit": True,
+        'enableRateLimit': True,          # ← Esto evita que te baneen por rate limit
+        'options': {
+            'defaultType': 'spot',
+        }
     })
 
 
-def obtener_velas(exchange, simbolo, timeframe, limite=100):
+def obtener_velas(exchange, simbolo, timeframe, limite=150):
     """Descarga las últimas N velas del exchange."""
-    velas = exchange.fetch_ohlcv(simbolo, timeframe=timeframe, limit=limite)
-    df = pd.DataFrame(velas, columns=["timestamp","open","high","low","close","volume"])
-    df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    df = df.set_index("datetime").drop(columns=["timestamp"])
+    try:
+        velas = exchange.fetch_ohlcv(simbolo, timeframe=timeframe, limit=limite)
+        df = pd.DataFrame(velas, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        df = df.set_index("datetime").drop(columns=["timestamp"])
+        return df
+    except Exception as e:
+        logger.error(f"Error al obtener velas: {e}")
+        time.sleep(10)   # espera antes de reintentar
+        raise  # para que el bucle principal lo maneje
     return df
 
 
