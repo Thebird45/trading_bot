@@ -141,28 +141,52 @@ class EstadoBot:
 # ============================================
 # FUNCIONES DE MERCADO
 # ============================================
-def crear_exchange():
-    return ccxt.binance({
-        'enableRateLimit': True,          # ← Esto evita que te baneen por rate limit
-        'options': {
-            'defaultType': 'spot',
-        }
-    })
+def crear_exchange(max_retries=3):
+    """Crea el exchange con reconexión automática"""
+    for intento in range(max_retries):
+        try:
+            exchange = ccxt.binance({
+                'enableRateLimit': True,
+                'options': {
+                    'defaultType': 'spot',
+                },
+                'timeout': 30000,        # 30 segundos
+            })
+            # Prueba ligera de conexión
+            markets = exchange.load_markets()
+            logger.info(f"✅ Conexión exitosa con Binance (intento {intento+1})")
+            return exchange
+        except Exception as e:
+            logger.warning(f"⚠️ Intento de conexión {intento+1}/{max_retries} fallido: {e}")
+            if intento < max_retries - 1:
+                time.sleep(5)
+    logger.error("❌ No se pudo conectar con Binance después de varios intentos")
+    raise Exception("Fallo crítico de conexión con Binance")
 
 
 def obtener_velas(exchange, simbolo, timeframe, limite=150):
-    """Descarga las últimas N velas del exchange."""
-    try:
-        velas = exchange.fetch_ohlcv(simbolo, timeframe=timeframe, limit=limite)
-        df = pd.DataFrame(velas, columns=["timestamp", "open", "high", "low", "close", "volume"])
-        df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-        df = df.set_index("datetime").drop(columns=["timestamp"])
-        return df
-    except Exception as e:
-        logger.error(f"Error al obtener velas: {e}")
-        time.sleep(10)   # espera antes de reintentar
-        raise  # para que el bucle principal lo maneje
-    return df
+    """Obtiene velas con reconexión y backoff"""
+    max_intentos = 3
+    for intento in range(max_intentos):
+        try:
+            velas = exchange.fetch_ohlcv(simbolo, timeframe=timeframe, limit=limite)
+            df = pd.DataFrame(velas, columns=["timestamp", "open", "high", "low", "close", "volume"])
+            df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+            df = df.set_index("datetime").drop(columns=["timestamp"])
+            return df
+        except Exception as e:
+            logger.warning(f"Error obteniendo velas (intento {intento+1}/{max_intentos}): {e}")
+            
+            if intento < max_intentos - 1:
+                espera = 8 * (2 ** intento)   # backoff simple
+                time.sleep(espera)
+                # Intentar reconectar
+                try:
+                    exchange = crear_exchange()
+                except:
+                    pass
+            else:
+                raise
 
 
 def calcular_rsi(df, periodo):
@@ -263,48 +287,47 @@ def mostrar_estado(estado, precio_actual, rsi, senal, params, ciclo):
 # BUCLE PRINCIPAL
 # ============================================
 
+# ============================================
+# BUCLE PRINCIPAL (VERSIÓN MEJORADA)
+# ============================================
 def main():
-    # Iniciar servidor web en hilo separado (necesario para Render)
+    # Iniciar servidor web para mantener Render activo
     threading.Thread(target=iniciar_servidor_web, daemon=True).start()
-    logger.info("Servidor web iniciado para mantener el servicio activo")
+    logger.info("Servidor web iniciado (anti-sleep en Render)")
 
-    params  = cargar_params()
-    estado  = EstadoBot(CAPITAL_INICIAL)
-    exchange= crear_exchange()
-    ciclo   = 0
+    params = cargar_params()
+    estado = EstadoBot(CAPITAL_INICIAL)
+    exchange = crear_exchange()
 
-    logger.remove()  # silenciar loguru en consola durante el display
+    ciclo = 0
+    errores_consecutivos = 0
+    MAX_ERRORES = 6
+
+    logger.remove()
     os.makedirs("logs", exist_ok=True)
     logger.add("logs/paper_trading.log", rotation="1 day", level="INFO")
 
-    logger.info("="*50)
-    logger.info("Paper Trading iniciado")
-    logger.info(f"Parámetros: {params}")
-    logger.info(f"Capital inicial: ${CAPITAL_INICIAL:,.2f}")
+    logger.info("=" * 75)
+    logger.info("🚀 TRADING BOT PRO — PAPER TRADING INICIADO (Versión Robusta)")
+    logger.info(f"Symbol: {SIMBOLO} | Timeframe: {TIMEFRAME} | Capital: ${CAPITAL_INICIAL:,.2f}")
 
-    print(f"\n  Iniciando Paper Trading en {SIMBOLO}...")
-    print(f"  Parámetros: RSI({params['rsi_periodo']}) | "
-          f"SV:{params['rsi_sobreventa']} | SC:{params['rsi_sobrecompra']} | "
-          f"SL:{params['stop_loss']*100:.1f}% | TP:{params['take_profit']*100:.1f}%")
-    print(f"\n  Descargando datos iniciales...")
+    print(f"\n🚀 Bot iniciado en {SIMBOLO} ({TIMEFRAME})")
+    print(f"RSI Period: {params['rsi_periodo']} | SV: {params['rsi_sobreventa']} | SC: {params['rsi_sobrecompra']}\n")
+
     time.sleep(2)
 
-    try:
-        while True:
-            ciclo += 1
-
-            # Obtener datos frescos
-            df     = obtener_velas(exchange, SIMBOLO, TIMEFRAME, limite=150)
+    while True:
+        ciclo += 1
+        try:
+            # === Obtener datos ===
+            df = obtener_velas(exchange, SIMBOLO, TIMEFRAME, limite=150)
             precio = df["close"].iloc[-1]
-
-            # Detectar señal
             senal, rsi = detectar_senal(df, params)
 
-            # Lógica de posición
+            # === Gestión de posición ===
             if estado.en_posicion:
                 razon = None
                 salida = None
-
                 if precio <= estado.stop_loss:
                     salida, razon = estado.stop_loss, "Stop Loss"
                 elif precio >= estado.take_profit:
@@ -314,8 +337,9 @@ def main():
 
                 if razon:
                     pnl = estado.cerrar_posicion(salida, razon)
-                    logger.info(f"CIERRE [{razon}] P&L: ${pnl:+.2f} | Capital: ${estado.capital:,.2f}")
+                    logger.info(f"CIERRE [{razon}] | P&L: ${pnl:+.2f} | Capital: ${estado.capital:,.2f}")
 
+            # === Abrir posición ===
             if not estado.en_posicion and senal == 1:
                 estado.abrir_posicion(
                     precio,
@@ -323,31 +347,46 @@ def main():
                     params["stop_loss"],
                     params["take_profit"],
                 )
-                logger.info(f"APERTURA @ ${precio:,.2f} | SL:${estado.stop_loss:,.2f} | TP:${estado.take_profit:,.2f}")
+                logger.info(f"APERTURA @ ${precio:,.2f} | SL: ${estado.stop_loss:,.2f} | TP: ${estado.take_profit:,.2f}")
 
-            # Mostrar estado en consola
+            # Mostrar estado y guardar
             mostrar_estado(estado, precio, rsi, senal, params, ciclo)
             estado.guardar_log()
 
+            errores_consecutivos = 0   # Reiniciar contador
             time.sleep(INTERVALO_SEG)
 
-    except KeyboardInterrupt:
-        print("\n\n  🛑 Paper Trading detenido por el usuario.")
-        estado.guardar_log()
+        except KeyboardInterrupt:
+            print("\n\n🛑 Bot detenido manualmente.")
+            estado.guardar_log()
+            r = estado.resumen()
+            if r:
+                print(f"\n══ RESUMEN FINAL ══")
+                print(f"Operaciones : {r['total']}")
+                print(f"Win Rate    : {r['win_rate']:.1f}%")
+                print(f"P&L Total   : ${r['pnl_total']:+,.2f}")
+                print(f"Capital final : ${r['capital']:,.2f}")
+            break
 
-        r = estado.resumen()
-        if r:
-            print(f"\n  ══ RESUMEN FINAL ══")
-            print(f"  Operaciones : {r['total']}")
-            print(f"  Win Rate    : {r['win_rate']:.1f}%")
-            print(f"  P&L Total   : ${r['pnl_total']:+,.2f}")
-            print(f"  Capital     : ${r['capital']:,.2f}")
-        else:
-            print(f"\n  Sin operaciones registradas.")
+        except Exception as e:
+            errores_consecutivos += 1
+            logger.error(f"Error en ciclo {ciclo}: {e}")
 
-        print(f"\n  Log guardado en: datos/paper_trading_log.csv")
-        print(f"  Log detallado : logs/paper_trading.log\n")
+            if errores_consecutivos >= MAX_ERRORES:
+                logger.critical(f"Demasiados errores consecutivos ({errores_consecutivos}). Deteniendo bot.")
+                print("\n❌ Demasiados errores. Bot detenido por seguridad.")
+                break
 
+            # === BACKOFF EXPONENCIAL ===
+            espera = min(30, 5 * (2 ** (errores_consecutivos - 1)))  # 5s → 10s → 20s → 30s máx
+            print(f"⚠️ Error temporal #{errores_consecutivos}. Reintentando en {espera} segundos...")
+            logger.info(f"Backoff: esperando {espera} segundos antes del próximo ciclo")
 
-if __name__ == "__main__":
-    main()
+            time.sleep(espera)
+
+            # Intentar reconectar el exchange
+            try:
+                logger.info("Intentando reconectar con Binance...")
+                exchange = crear_exchange()
+            except Exception as recon_error:
+                logger.error(f"Fallo en reconexión: {recon_error}")
