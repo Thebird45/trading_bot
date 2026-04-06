@@ -1,0 +1,54 @@
+name: Paper Trading
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+jobs:
+  run-paper-trading:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Restore cached datos
+        id: cache-datos-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: datos
+          key: paper-trading-datos-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            paper-trading-datos-${{ github.ref_name }}-
+
+      - name: Ensure datos directory exists
+        run: mkdir -p datos
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy ta ccxt loguru
+
+      - name: Run paper trading cycle
+        run: python fase6_paper_trading.py
+
+      - name: Save datos cache
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@v4
+        with:
+          path: datos
+          key: paper-trading-datos-${{ github.ref_name }}-${{ github.run_id }}
+
+      - name: Upload paper trading log
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: paper-trading-log
+          path: datos/paper_trading_log.csv
+          if-no-files-found: warn

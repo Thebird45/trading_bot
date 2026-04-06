@@ -17,9 +17,11 @@ import pandas as pd
 import ta
 import json
 import os
+import sys
 import time
 from datetime import datetime, timezone
 from loguru import logger
+
 
 # ============================================
 # CONFIGURACIÓN
@@ -29,10 +31,17 @@ TIMEFRAME        = "1h"
 CAPITAL_INICIAL  = 10_000.0     # USD simulados
 RIESGO_POR_TRADE = 0.10
 COMISION_PCT     = 0.001
-INTERVALO_SEG    = 60           # revisar cada 60 segundos
 
 # Cargar parámetros optimizados
 PARAMS_FILE = "datos/mejores_params.json"
+ESTADO_FILE = "datos/estado_bot.json"
+
+
+def configurar_logger():
+    os.makedirs("logs", exist_ok=True)
+    logger.remove()
+    logger.add(sys.stdout, level="INFO", enqueue=True)
+    logger.add("logs/paper_trading.log", rotation="1 day", level="INFO", enqueue=True)
 
 def cargar_params():
     if os.path.exists(PARAMS_FILE):
@@ -110,25 +119,109 @@ class EstadoBot:
                 "datos/paper_trading_log.csv", index=False
             )
 
+    def to_dict(self):
+        return {
+            "capital": self.capital,
+            "en_posicion": self.en_posicion,
+            "precio_entrada": self.precio_entrada,
+            "stop_loss": self.stop_loss,
+            "take_profit": self.take_profit,
+            "fecha_entrada": self.fecha_entrada.isoformat() if self.fecha_entrada else None,
+            "trades": self.trades,
+            "velas_vistas": self.velas_vistas,
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        estado = cls(data.get("capital", CAPITAL_INICIAL))
+        estado.en_posicion = data.get("en_posicion", False)
+        estado.precio_entrada = data.get("precio_entrada", 0.0)
+        estado.stop_loss = data.get("stop_loss", 0.0)
+        estado.take_profit = data.get("take_profit", 0.0)
+        fecha_entrada = data.get("fecha_entrada")
+        estado.fecha_entrada = datetime.fromisoformat(fecha_entrada) if fecha_entrada else None
+        estado.trades = data.get("trades", [])
+        estado.velas_vistas = data.get("velas_vistas", 0)
+        return estado
+
+
+def cargar_estado():
+    os.makedirs("datos", exist_ok=True)
+    if not os.path.exists(ESTADO_FILE):
+        logger.info("No se encontró estado previo; iniciando bot desde cero")
+        return EstadoBot(CAPITAL_INICIAL)
+
+    with open(ESTADO_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    logger.info(f"Estado cargado desde {ESTADO_FILE}")
+    return EstadoBot.from_dict(data)
+
+
+def guardar_estado(estado):
+    os.makedirs("datos", exist_ok=True)
+    with open(ESTADO_FILE, "w", encoding="utf-8") as f:
+        json.dump(estado.to_dict(), f, indent=2)
+    logger.info(f"Estado guardado en {ESTADO_FILE}")
+
 
 # ============================================
 # FUNCIONES DE MERCADO
 # ============================================
 
-def crear_exchange():
-    return ccxt.bybit({
-        "options"        : {"defaultType": "spot"},
-        "enableRateLimit": True,
-    })
+# ============================================
+# FUNCIONES DE MERCADO
+# ============================================
+def crear_exchange(max_retries=3):
+    """Crea el exchange con reconexión automática"""
+    for intento in range(max_retries):
+        try:
+            exchange = ccxt.binance({
+                'enableRateLimit': True,
+                'options': {
+                    'defaultType': 'spot',
+                },
+                'timeout': 30000,        # 30 segundos
+            })
+            # Prueba ligera de conexión
+            markets = exchange.load_markets()
+            logger.info(f"✅ Conexión exitosa con Binance (intento {intento+1})")
+            return exchange
+        except Exception as e:
+            logger.warning(f"⚠️ Intento de conexión {intento+1}/{max_retries} fallido: {e}")
+            if intento < max_retries - 1:
+                time.sleep(5)
+    logger.error("❌ No se pudo conectar con Binance después de varios intentos")
+    raise Exception("Fallo crítico de conexión con Binance")
 
 
-def obtener_velas(exchange, simbolo, timeframe, limite=100):
-    """Descarga las últimas N velas del exchange."""
-    velas = exchange.fetch_ohlcv(simbolo, timeframe=timeframe, limit=limite)
-    df = pd.DataFrame(velas, columns=["timestamp","open","high","low","close","volume"])
-    df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    df = df.set_index("datetime").drop(columns=["timestamp"])
-    return df
+def obtener_velas(exchange, simbolo, timeframe, limite=150):
+    """Obtiene velas con reconexión y backoff"""
+    max_intentos = 3
+    for intento in range(max_intentos):
+        try:
+            velas = exchange.fetch_ohlcv(simbolo, timeframe=timeframe, limit=limite)
+            df = pd.DataFrame(velas, columns=["timestamp", "open", "high", "low", "close", "volume"])
+            df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+            df = df.set_index("datetime").drop(columns=["timestamp"])
+            return df
+        except (ccxt.NetworkError, ccxt.ExchangeError) as e:
+            logger.warning(f"Error de red/API obteniendo velas (intento {intento+1}/{max_intentos}): {e}")
+            
+            if intento < max_intentos - 1:
+                espera = 8 * (2 ** intento)   # backoff simple
+                time.sleep(espera)
+                # Intentar reconectar
+                try:
+                    exchange = crear_exchange()
+                except Exception as recon_error:
+                    logger.warning(f"Reconexión fallida tras error de red: {recon_error}")
+            else:
+                logger.error("No se pudieron obtener velas tras varios intentos; se reintentará en el siguiente ciclo")
+                return None
+        except Exception as e:
+            logger.exception(f"Error inesperado obteniendo velas: {e}")
+            raise
 
 
 def calcular_rsi(df, periodo):
@@ -154,161 +247,149 @@ def detectar_senal(df, params):
 # DISPLAY EN CONSOLA
 # ============================================
 
-def limpiar():
-    os.system("cls" if os.name == "nt" else "clear")
-
 
 def mostrar_estado(estado, precio_actual, rsi, senal, params, ciclo):
-    limpiar()
     ahora = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-    print("╔══════════════════════════════════════════════╗")
-    print("║      TRADING BOT PRO — Paper Trading         ║")
-    print("╚══════════════════════════════════════════════╝")
-    print(f"  🕐 {ahora}   Ciclo #{ciclo}")
-    print(f"  📊 {SIMBOLO} · {TIMEFRAME}")
-    print()
 
     retorno = (estado.capital / CAPITAL_INICIAL - 1) * 100
     signo   = "+" if retorno >= 0 else ""
-    print(f"  💰 Capital : ${estado.capital:>10,.2f}  ({signo}{retorno:.2f}%)")
-    print()
 
-    # RSI
     if rsi < params["rsi_sobreventa"]:
-        zona_rsi = "🟢 SOBREVENTA"
+        zona_rsi = "SOBREVENTA"
     elif rsi > params["rsi_sobrecompra"]:
-        zona_rsi = "🔴 SOBRECOMPRA"
+        zona_rsi = "SOBRECOMPRA"
     else:
-        zona_rsi = "🟡 NEUTRAL"
+        zona_rsi = "NEUTRAL"
 
-    print(f"  📈 BTC/USDT : ${precio_actual:>12,.2f}")
-    print(f"  📉 RSI({params['rsi_periodo']})  :  {rsi:>6.1f}  {zona_rsi}")
-    print()
+    lineas = [
+        "=" * 54,
+        f"TRADING BOT PRO | PAPER TRADING | {ahora} | Ciclo #{ciclo}",
+        f"Mercado: {SIMBOLO} | Timeframe: {TIMEFRAME}",
+        f"Capital: ${estado.capital:>10,.2f} ({signo}{retorno:.2f}%)",
+        f"Precio actual: ${precio_actual:>12,.2f}",
+        f"RSI({params['rsi_periodo']}): {rsi:>6.1f} | Zona: {zona_rsi}",
+    ]
 
-    # Posición actual
     if estado.en_posicion:
         pnl_actual = (precio_actual / estado.precio_entrada - 1) * 100
         signo_pnl  = "+" if pnl_actual >= 0 else ""
-        print(f"  🔵 POSICIÓN ABIERTA")
-        print(f"     Entrada    : ${estado.precio_entrada:>10,.2f}")
-        print(f"     Stop Loss  : ${estado.stop_loss:>10,.2f}  ({params['stop_loss']*100:.1f}%)")
-        print(f"     Take Profit: ${estado.take_profit:>10,.2f}  ({params['take_profit']*100:.1f}%)")
-        print(f"     P&L actual : {signo_pnl}{pnl_actual:.2f}%")
+        lineas.extend([
+            "Posición: ABIERTA",
+            f"Entrada: ${estado.precio_entrada:>10,.2f}",
+            f"Stop Loss: ${estado.stop_loss:>10,.2f} ({params['stop_loss']*100:.1f}%)",
+            f"Take Profit: ${estado.take_profit:>10,.2f} ({params['take_profit']*100:.1f}%)",
+            f"P&L actual: {signo_pnl}{pnl_actual:.2f}%",
+        ])
     else:
-        print(f"  ⚪ Sin posición abierta — esperando señal")
+        lineas.append("Posición: SIN POSICIÓN ABIERTA")
 
-    # Señal actual
-    print()
     if senal == 1:
-        print(f"  🚀 SEÑAL: COMPRA detectada")
+        lineas.append("Señal: COMPRA detectada")
     elif senal == -1:
-        print(f"  🛑 SEÑAL: VENTA detectada")
+        lineas.append("Señal: VENTA detectada")
     else:
-        print(f"  ⏳ Sin señal nueva")
+        lineas.append("Señal: sin novedad")
 
-    # Historial de trades
-    print()
-    print(f"  ─────────────────────────────────────────")
     if estado.trades:
-        print(f"  Últimos trades:")
+        lineas.append("Últimos trades:")
         for t in estado.trades[-5:]:
-            emoji = "✅" if t["pnl"] > 0 else "❌"
-            print(f"  {emoji} {t['entrada']} → ${t['pnl']:+.2f}  [{t['razon']}]")
+            resultado = "WIN" if t["pnl"] > 0 else "LOSS"
+            lineas.append(f"{resultado} | {t['entrada']} | ${t['pnl']:+.2f} | {t['razon']}")
 
         r = estado.resumen()
-        print(f"\n  Operaciones: {r['total']}  |  Win Rate: {r['win_rate']:.0f}%  |  P&L total: ${r['pnl_total']:+.2f}")
+        lineas.append(
+            f"Operaciones: {r['total']} | Win Rate: {r['win_rate']:.0f}% | P&L total: ${r['pnl_total']:+.2f}"
+        )
     else:
-        print(f"  Sin trades aún — esperando primera señal")
+        lineas.append("Sin trades aún; esperando primera señal")
 
-    print(f"  ─────────────────────────────────────────")
-    print(f"\n  [Ctrl+C para detener y guardar reporte]")
+    lineas.append("Ctrl+C para detener y guardar reporte")
+    lineas.append("=" * 54)
+
+    logger.info("\n" + "\n".join(lineas))
 
 
 # ============================================
-# BUCLE PRINCIPAL
+# EJECUCIÓN ÚNICA
 # ============================================
-
 def main():
-    params  = cargar_params()
-    estado  = EstadoBot(CAPITAL_INICIAL)
-    exchange= crear_exchange()
-    ciclo   = 0
+    configurar_logger()
+    logger.info("Script iniciado - modo una ejecución para GitHub Actions")
+    
+    try:
+        params = cargar_params()
+        estado = cargar_estado()
+        exchange = crear_exchange()
+        logger.info("Exchange creado correctamente (Binance)")
 
-    logger.remove()  # silenciar loguru en consola durante el display
-    os.makedirs("logs", exist_ok=True)
-    logger.add("logs/paper_trading.log", rotation="1 day", level="INFO")
+    except Exception as e:
+        logger.error(f"Error crítico al iniciar: {e}")
+        logger.exception("Error fatal al iniciar el bot")
+        raise
 
-    logger.info("="*50)
-    logger.info("Paper Trading iniciado")
-    logger.info(f"Parámetros: {params}")
-    logger.info(f"Capital inicial: ${CAPITAL_INICIAL:,.2f}")
-
-    print(f"\n  Iniciando Paper Trading en {SIMBOLO}...")
-    print(f"  Parámetros: RSI({params['rsi_periodo']}) | "
-          f"SV:{params['rsi_sobreventa']} | SC:{params['rsi_sobrecompra']} | "
-          f"SL:{params['stop_loss']*100:.1f}% | TP:{params['take_profit']*100:.1f}%")
-    print(f"\n  Descargando datos iniciales...")
-    time.sleep(2)
+    logger.info("=" * 75)
+    logger.info("TRADING BOT PRO — PAPER TRADING | EJECUCIÓN ÚNICA")
+    logger.info(f"Symbol: {SIMBOLO} | Timeframe: {TIMEFRAME} | Capital: ${CAPITAL_INICIAL:,.2f}")
+    logger.info(
+        f"RSI Period: {params['rsi_periodo']} | SV: {params['rsi_sobreventa']} | SC: {params['rsi_sobrecompra']}"
+    )
 
     try:
-        while True:
-            ciclo += 1
+        df = obtener_velas(exchange, SIMBOLO, TIMEFRAME, limite=150)
+        if df is None:
+            logger.warning("No se recibieron velas en esta ejecución; se conserva el estado actual")
+            guardar_estado(estado)
+            return
 
-            # Obtener datos frescos
-            df     = obtener_velas(exchange, SIMBOLO, TIMEFRAME, limite=150)
-            precio = df["close"].iloc[-1]
+        precio = df["close"].iloc[-1]
+        senal, rsi = detectar_senal(df, params)
 
-            # Detectar señal
-            senal, rsi = detectar_senal(df, params)
+        if estado.en_posicion:
+            razon = None
+            salida = None
+            if precio <= estado.stop_loss:
+                salida, razon = estado.stop_loss, "Stop Loss"
+            elif precio >= estado.take_profit:
+                salida, razon = estado.take_profit, "Take Profit"
+            elif senal == -1:
+                salida, razon = precio, "Señal RSI"
 
-            # Lógica de posición
-            if estado.en_posicion:
-                razon = None
-                salida = None
+            if razon:
+                pnl = estado.cerrar_posicion(salida, razon)
+                logger.info(f"CIERRE [{razon}] | P&L: ${pnl:+.2f} | Capital: ${estado.capital:,.2f}")
 
-                if precio <= estado.stop_loss:
-                    salida, razon = estado.stop_loss, "Stop Loss"
-                elif precio >= estado.take_profit:
-                    salida, razon = estado.take_profit, "Take Profit"
-                elif senal == -1:
-                    salida, razon = precio, "Señal RSI"
+        if not estado.en_posicion and senal == 1:
+            estado.abrir_posicion(
+                precio,
+                datetime.now(timezone.utc),
+                params["stop_loss"],
+                params["take_profit"],
+            )
+            logger.info(f"APERTURA @ ${precio:,.2f} | SL: ${estado.stop_loss:,.2f} | TP: ${estado.take_profit:,.2f}")
 
-                if razon:
-                    pnl = estado.cerrar_posicion(salida, razon)
-                    logger.info(f"CIERRE [{razon}] P&L: ${pnl:+.2f} | Capital: ${estado.capital:,.2f}")
-
-            if not estado.en_posicion and senal == 1:
-                estado.abrir_posicion(
-                    precio,
-                    datetime.now(timezone.utc),
-                    params["stop_loss"],
-                    params["take_profit"],
-                )
-                logger.info(f"APERTURA @ ${precio:,.2f} | SL:${estado.stop_loss:,.2f} | TP:${estado.take_profit:,.2f}")
-
-            # Mostrar estado en consola
-            mostrar_estado(estado, precio, rsi, senal, params, ciclo)
-            estado.guardar_log()
-
-            time.sleep(INTERVALO_SEG)
-
-    except KeyboardInterrupt:
-        print("\n\n  🛑 Paper Trading detenido por el usuario.")
+        mostrar_estado(estado, precio, rsi, senal, params, ciclo=1)
         estado.guardar_log()
+        guardar_estado(estado)
 
         r = estado.resumen()
         if r:
-            print(f"\n  ══ RESUMEN FINAL ══")
-            print(f"  Operaciones : {r['total']}")
-            print(f"  Win Rate    : {r['win_rate']:.1f}%")
-            print(f"  P&L Total   : ${r['pnl_total']:+,.2f}")
-            print(f"  Capital     : ${r['capital']:,.2f}")
-        else:
-            print(f"\n  Sin operaciones registradas.")
+            logger.info("RESUMEN ACTUAL")
+            logger.info(f"Operaciones: {r['total']}")
+            logger.info(f"Win Rate: {r['win_rate']:.1f}%")
+            logger.info(f"P&L Total: ${r['pnl_total']:+,.2f}")
+            logger.info(f"Capital final: ${r['capital']:,.2f}")
 
-        print(f"\n  Log guardado en: datos/paper_trading_log.csv")
-        print(f"  Log detallado : logs/paper_trading.log\n")
+    except KeyboardInterrupt:
+        logger.info("Ejecución interrumpida manualmente")
+        estado.guardar_log()
+        guardar_estado(estado)
+
+    except Exception as e:
+        logger.error(f"Error en la ejecución del ciclo: {e}")
+        logger.exception("Fallo durante la ejecución única")
+        estado.guardar_log()
+        guardar_estado(estado)
+        raise
 
 
 if __name__ == "__main__":
