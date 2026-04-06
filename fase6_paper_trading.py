@@ -176,23 +176,19 @@ def crear_exchange(max_retries=3):
     """Crea el exchange con reconexión automática"""
     for intento in range(max_retries):
         try:
-            exchange = ccxt.binance({
-                'enableRateLimit': True,
-                'options': {
-                    'defaultType': 'spot',
-                },
-                'timeout': 30000,        # 30 segundos
+            exchange = ccxt.bybit({
+                "enableRateLimit": True,
+                "options": {"defaultType": "spot"},
+                "timeout": 30000,
             })
-            # Prueba ligera de conexión
-            markets = exchange.load_markets()
-            logger.info(f"✅ Conexión exitosa con Binance (intento {intento+1})")
+            logger.info(f"✅ Conexión exitosa con Bybit (intento {intento+1})")
             return exchange
         except Exception as e:
             logger.warning(f"⚠️ Intento de conexión {intento+1}/{max_retries} fallido: {e}")
             if intento < max_retries - 1:
                 time.sleep(5)
-    logger.error("❌ No se pudo conectar con Binance después de varios intentos")
-    raise Exception("Fallo crítico de conexión con Binance")
+    logger.error("❌ No se pudo conectar con Bybit después de varios intentos")
+    raise Exception("Fallo crítico de conexión con Bybit")
 
 
 def obtener_velas(exchange, simbolo, timeframe, limite=150):
